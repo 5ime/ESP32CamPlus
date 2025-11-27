@@ -72,6 +72,9 @@ bool isStreaming = false;
 
 extern "C" void app_set_flash_duty(uint8_t duty);
 extern "C" uint8_t app_get_flash_duty();
+extern "C" bool app_upload_to_cloud();
+extern "C" uint32_t app_get_upload_count();
+extern "C" uint32_t app_get_upload_fail_count();
 
 typedef struct {
     httpd_req_t *req;
@@ -242,10 +245,14 @@ void enable_led(bool en) {
 static esp_err_t bmp_handler(httpd_req_t *req) {
     camera_fb_t *fb = NULL;
     esp_err_t res = ESP_OK;
+    uint8_t *buf = NULL;
+    size_t buf_len = 0;
+    
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
     uint64_t fr_start = esp_timer_get_time();
 #endif
 
+    // 获取摄像头帧
     fb = esp_camera_fb_get();
     if (!fb) {
         log_e("Camera capture failed");
@@ -253,30 +260,39 @@ static esp_err_t bmp_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
+    // 设置响应头
     httpd_resp_set_type(req, "image/x-windows-bmp");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.bmp");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
+    // 添加时间戳
     char ts[32];
-    snprintf(ts, 32, "%ld.%06ld", fb->timestamp.tv_sec, fb->timestamp.tv_usec);
-    httpd_resp_set_hdr(req, "X-Timestamp", (const char *)ts);
+    snprintf(ts, sizeof(ts), "%ld.%06ld", fb->timestamp.tv_sec, fb->timestamp.tv_usec);
+    httpd_resp_set_hdr(req, "X-Timestamp", ts);
 
-    uint8_t *buf = NULL;
-    size_t buf_len = 0;
+    // 转换为BMP格式
     bool converted = frame2bmp(fb, &buf, &buf_len);
     esp_camera_fb_return(fb);
-    if (!converted) {
-        log_e("BMP Conversion failed");
+    fb = NULL;
+    
+    if (!converted || buf == NULL) {
+        log_e("BMP conversion failed");
+        if (buf) {
+            free(buf);
+        }
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
+    // 发送响应
     res = httpd_resp_send(req, (const char *)buf, buf_len);
     free(buf);
+    
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
     uint64_t fr_end = esp_timer_get_time();
-#endif
     log_i("BMP: %llums, %uB", (uint64_t)((fr_end - fr_start) / 1000), buf_len);
+#endif
+    
     return res;
 }
 
@@ -295,10 +311,12 @@ static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_
 static esp_err_t capture_handler(httpd_req_t *req) {
     camera_fb_t *fb = NULL;
     esp_err_t res = ESP_OK;
+    
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
     int64_t fr_start = esp_timer_get_time();
 #endif
 
+    // 拍照时启用补光灯（如果启用）
 #if CONFIG_LED_ILLUMINATOR_ENABLED
     enable_led(true);
     vTaskDelay(150 / portTICK_PERIOD_MS);
@@ -606,7 +624,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
                             auto &results = s1.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3});
 #endif
 #if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                            fr_face = esp_timer_get时间();
+                            fr_face = esp_timer_get_time();
                             fr_recognize = fr_face;
 #endif
                             if (results.size() > 0) {
@@ -700,21 +718,29 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 }
 
 static esp_err_t parse_get(httpd_req_t *req, char **obuf) {
-    char *buf = NULL;
-    size_t buf_len = 0;
-    buf_len = httpd_req_get_url_query_len(req) + 1;
-    if (buf_len > 1) {
-        buf = (char *)malloc(buf_len);
-        if (!buf) {
-            httpd_resp_send_500(req);
-            return ESP_FAIL;
-        }
-        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
-            *obuf = buf;
-            return ESP_OK;
-        }
-        free(buf);
+    if (obuf == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
+    
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len <= 1) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+    
+    char *buf = (char *)malloc(buf_len);
+    if (!buf) {
+        log_e("Failed to allocate memory for query string");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    
+    if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+        *obuf = buf;
+        return ESP_OK;
+    }
+    
+    free(buf);
     httpd_resp_send_404(req);
     return ESP_FAIL;
 }
@@ -1090,7 +1116,17 @@ static esp_err_t index_handler(httpd_req_t *req) {
     }
 }
 
-// ==== 新增：闪光灯 HTTP 接口 ====
+// ==== 闪光灯 HTTP 接口 ====
+// 常量定义
+#define FLASH_MAX_LEVEL 255
+#define FLASH_MIN_LEVEL 0
+#define FLASH_MAX_INTERVAL_MS 5000
+#define FLASH_MIN_INTERVAL_MS 0
+#define FLASH_MAX_COUNT 20
+#define FLASH_MIN_COUNT 0
+#define FLASH_QUERY_BUF_SIZE 64
+#define FLASH_RESP_BUF_SIZE 80
+
 static void flash_burst(uint8_t level, uint16_t interval_ms, uint8_t repeat) {
     if (repeat == 0 || interval_ms == 0) {
         return;
@@ -1108,74 +1144,135 @@ static void flash_burst(uint8_t level, uint16_t interval_ms, uint8_t repeat) {
 }
 
 static esp_err_t flash_handler(httpd_req_t *req) {
-    char query[64];
-    bool updated = false;
+    char query[FLASH_QUERY_BUF_SIZE];
     bool enable = false;
     bool enable_defined = false;
     uint8_t pulse_count = 0;
     uint16_t pulse_interval = 0;
     int target_level = -1;
+    
+    // Lambda函数：数值范围限制
     auto clamp = [](int value, int min_value, int max_value) {
         return std::max(min_value, std::min(value, max_value));
     };
+    
+    // Lambda函数：解析布尔值
     auto parse_bool = [](const char *text) {
-        return (strcmp(text, "1") == 0) || (strcasecmp(text, "true") == 0) || (strcasecmp(text, "on") == 0);
+        return (strcmp(text, "1") == 0) || 
+               (strcasecmp(text, "true") == 0) || 
+               (strcasecmp(text, "on") == 0);
     };
 
+    // 解析URL查询参数
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         char param[16];
+        
+        // 解析 enable 参数
         if (httpd_query_key_value(query, "enable", param, sizeof(param)) == ESP_OK) {
             enable = parse_bool(param);
             enable_defined = true;
-            updated = true;
         }
+        
+        // 解析 level 参数
         if (httpd_query_key_value(query, "level", param, sizeof(param)) == ESP_OK) {
-            target_level = clamp(atoi(param), 0, 255);
-            updated = true;
+            target_level = clamp(atoi(param), FLASH_MIN_LEVEL, FLASH_MAX_LEVEL);
         }
+        
+        // 解析 interval 参数
         if (httpd_query_key_value(query, "interval", param, sizeof(param)) == ESP_OK) {
-            pulse_interval = static_cast<uint16_t>(clamp(atoi(param), 0, 5000));
-            updated = true;
+            pulse_interval = static_cast<uint16_t>(
+                clamp(atoi(param), FLASH_MIN_INTERVAL_MS, FLASH_MAX_INTERVAL_MS));
         }
+        
+        // 解析 count 参数
         if (httpd_query_key_value(query, "count", param, sizeof(param)) == ESP_OK) {
-            pulse_count = static_cast<uint8_t>(clamp(atoi(param), 0, 20));
-            updated = true;
+            pulse_count = static_cast<uint8_t>(
+                clamp(atoi(param), FLASH_MIN_COUNT, FLASH_MAX_COUNT));
         }
     }
 
+    // 验证必需参数
     if (!enable_defined) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "请提供 enable=0/1");
-        return ESP_OK;
+        return ESP_FAIL;
     }
 
+    // 执行闪光灯控制逻辑
     if (!enable) {
+        // 关闭闪光灯
         app_set_flash_duty(0);
         pulse_count = 0;
     } else if (pulse_count == 0 || pulse_interval == 0) {
+        // 常亮模式
         if (target_level < 0) {
             target_level = app_get_flash_duty();
         }
         app_set_flash_duty(static_cast<uint8_t>(target_level));
     } else {
+        // 闪烁模式
         if (target_level < 0) {
-            target_level = 255;
+            target_level = FLASH_MAX_LEVEL;
         }
         flash_burst(static_cast<uint8_t>(target_level), pulse_interval, pulse_count);
     }
 
-    char resp[80];
-    snprintf(resp, sizeof(resp), "{\"enable\":%u,\"level\":%u,\"interval\":%u,\"count\":%u}",
+    // 返回JSON响应
+    char resp[FLASH_RESP_BUF_SIZE];
+    snprintf(resp, sizeof(resp), 
+             "{\"enable\":%u,\"level\":%u,\"interval\":%u,\"count\":%u}",
              enable ? 1 : 0,
              app_get_flash_duty(),
              pulse_interval,
              pulse_count);
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_sendstr(req, resp);
-    Serial.printf("[信息] Web 闪光灯 enable=%u level=%u interval=%u count=%u\n",
-                  enable ? 1 : 0,
-                  app_get_flash_duty(),
-                  pulse_interval,
-                  pulse_count);
+    
+    log_i("Flash: enable=%u level=%u interval=%u count=%u",
+          enable ? 1 : 0,
+          app_get_flash_duty(),
+          pulse_interval,
+          pulse_count);
+    return ESP_OK;
+}
+
+// ==== 云服务器上传 HTTP 接口 ====
+static esp_err_t cloud_upload_handler(httpd_req_t *req) {
+    bool success = false;
+    
+    log_i("Cloud upload request received");
+    
+    // 调用上传函数（会自动获取新的帧）
+    success = app_upload_to_cloud();
+    
+    // 返回JSON响应
+    char resp[128];
+    snprintf(resp, sizeof(resp), 
+             "{\"success\":%s,\"upload_count\":%lu,\"fail_count\":%lu}",
+             success ? "true" : "false",
+             app_get_upload_count(),
+             app_get_upload_fail_count());
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_sendstr(req, resp);
+    
+    log_i("Cloud upload completed: %s", success ? "success" : "failed");
+    return ESP_OK;
+}
+
+// ==== 云上传状态查询接口 ====
+static esp_err_t cloud_status_handler(httpd_req_t *req) {
+    char resp[128];
+    snprintf(resp, sizeof(resp), 
+             "{\"upload_count\":%lu,\"fail_count\":%lu,\"total\":%lu}",
+             app_get_upload_count(),
+             app_get_upload_fail_count(),
+             app_get_upload_count() + app_get_upload_fail_count());
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_sendstr(req, resp);
     return ESP_OK;
 }
 
@@ -1183,6 +1280,7 @@ void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 16;
 
+    // 定义URI处理器
     httpd_uri_t index_uri = {"/", HTTP_GET, index_handler, NULL};
     httpd_uri_t status_uri = {"/status", HTTP_GET, status_handler, NULL};
     httpd_uri_t cmd_uri = {"/control", HTTP_GET, cmd_handler, NULL};
@@ -1195,14 +1293,19 @@ void startCameraServer() {
     httpd_uri_t pll_uri = {"/pll", HTTP_GET, pll_handler, NULL};
     httpd_uri_t win_uri = {"/resolution", HTTP_GET, win_handler, NULL};
     httpd_uri_t flash_uri = {"/flash", HTTP_GET, flash_handler, NULL};
+    httpd_uri_t cloud_upload_uri = {"/cloud/upload", HTTP_GET, cloud_upload_handler, NULL};
+    httpd_uri_t cloud_status_uri = {"/cloud/status", HTTP_GET, cloud_status_handler, NULL};
 
+    // 初始化帧率过滤器
     ra_filter_init(&ra_filter, 20);
 
 #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
+    // 初始化人脸识别器
     recognizer.set_partition(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fr");
     recognizer.set_ids_from_flash();
 #endif
 
+    // 启动主HTTP服务器（控制接口）
     log_i("Starting web server on port: '%d'", config.server_port);
     if (httpd_start(&camera_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(camera_httpd, &index_uri);
@@ -1216,13 +1319,22 @@ void startCameraServer() {
         httpd_register_uri_handler(camera_httpd, &pll_uri);
         httpd_register_uri_handler(camera_httpd, &win_uri);
         httpd_register_uri_handler(camera_httpd, &flash_uri);
+        httpd_register_uri_handler(camera_httpd, &cloud_upload_uri);
+        httpd_register_uri_handler(camera_httpd, &cloud_status_uri);
+        log_i("Web server started successfully");
+    } else {
+        log_e("Failed to start web server");
     }
 
+    // 启动流媒体服务器（独立端口）
     config.server_port += 1;
     config.ctrl_port += 1;
     log_i("Starting stream server on port: '%d'", config.server_port);
     if (httpd_start(&stream_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(stream_httpd, &stream_uri);
+        log_i("Stream server started successfully");
+    } else {
+        log_e("Failed to start stream server");
     }
 }
 
