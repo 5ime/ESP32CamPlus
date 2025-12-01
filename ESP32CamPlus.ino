@@ -36,20 +36,20 @@ constexpr camera_grab_mode_t CAMERA_GRAB_MODE = CAMERA_GRAB_LATEST;
 constexpr uint32_t SERIAL_BAUD = 115200;
 
 // ================== 服务器配置 ==================
-constexpr char SERVER_HOST[] = "192.168.137.1";          // 服务器地址
+constexpr char SERVER_HOST[] = "your_server_ip";          // 服务器地址
 constexpr int SERVER_PORT = 8000;                        // 服务器端口
 constexpr char CLOUD_API_PATH[] = "/api/upload";         // 云上传API路径
 constexpr char WS_STREAM_PATH[] = "/ws/stream";          // WebSocket流路径
 
 // ================== 云服务器配置 ==================
-constexpr bool CLOUD_UPLOAD_ENABLED = true;              // 是否启用云上传
+constexpr bool CLOUD_UPLOAD_ENABLED = false;              // 是否启用云上传
 constexpr char CLOUD_API_KEY[] = "your-api-key";         // API密钥（可选）
 constexpr uint32_t CLOUD_UPLOAD_INTERVAL = 0;            // 自动上传间隔(ms)，0=禁用自动上传
 constexpr uint32_t CLOUD_UPLOAD_TIMEOUT = 10000;         // 上传超时时间(ms)
 constexpr bool CLOUD_UPLOAD_VERIFY_SSL = false;          // 是否验证SSL证书（生产环境建议true）
 
 // ================== WebSocket 视频流配置 ==================
-constexpr bool WEBSOCKET_STREAM_ENABLED = true;          // 是否启用 WebSocket 视频流推送
+constexpr bool WEBSOCKET_STREAM_ENABLED = false;          // 是否启用 WebSocket 视频流推送
 constexpr int WS_STREAM_FPS = 10;                        // 视频流帧率（FPS）
 constexpr uint32_t WS_STREAM_INTERVAL = 1000 / WS_STREAM_FPS;  // 帧间隔（毫秒）
 constexpr uint32_t WS_RECONNECT_INTERVAL = 5000;        // WebSocket 重连间隔(ms)
